@@ -1,6 +1,8 @@
 # Vencer
 
-<img src="assets/vencer-readme-hero.png" alt="Vencer hero image" width="50%">
+<p align="center">
+  <img src="assets/vencer-readme-hero.png" alt="Vencer hero image" width="50%">
+</p>
 
 Vencer is a private, local-first AI coach for turning personal goals into realistic daily action plans. It uses Gemma 4 E4B on Android through Google LiteRT-LM, so the core planning experience can run on the user's device instead of depending on a remote AI server.
 
