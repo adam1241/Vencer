@@ -1,0 +1,18 @@
+{
+  "name": "ziel-ai-server",
+  "version": "1.0.0",
+  "description": "Backend proxy for Groq AI — rate limiting, caching, key protection",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^17.3.1",
+    "express": "^4.21.0",
+    "express-rate-limit": "^7.4.0",
+    "groq-sdk": "^0.8.0",
+    "node-cache": "^5.1.2"
+  }
+}

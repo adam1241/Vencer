@@ -1,0 +1,46 @@
+{
+  "expo": {
+    "name": "Vencer",
+    "slug": "Ziel",
+    "version": "0.1.2",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "scheme": "ziel",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#ffffff"
+    },
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "minSdkVersion": 32,
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#ffffff"
+      },
+      "edgeToEdgeEnabled": true,
+      "predictiveBackGestureEnabled": false,
+      "package": "vencer.v01.goalsbuildingapp"
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-router",
+      "@react-native-community/datetimepicker"
+    ],
+    "extra": {
+      "supabaseUrl": "https://qwkvadyticxepklyaqsf.supabase.co",
+      "supabaseAnonKey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InF3a3ZhZHl0aWN4ZXBrbHlhcXNmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njg0MjQ5NDEsImV4cCI6MjA4NDAwMDk0MX0.y0KUiUYNdukYEHwah6U3yJxltdq_UwPDgdBMsFBeSAI",
+      "router": {},
+      "eas": {
+        "projectId": "56c8221f-8ed5-4951-9d0f-7c2725a1fae6"
+      },
+      "apiUrl": "http://10.10.164.105:3001"
+    }
+  }
+}
