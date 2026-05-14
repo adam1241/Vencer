@@ -1,5 +1,7 @@
 # Vencer
 
+![Vencer hero image](assets/vencer-readme-hero.png)
+
 Vencer is a private, local-first AI coach for turning personal goals into realistic daily action plans. It uses Gemma 4 E4B on Android through Google LiteRT-LM, so the core planning experience can run on the user's device instead of depending on a remote AI server.
 
 The project was built for the Gemma 4 Good Hackathon around a simple idea: people who most need guidance often have the least reliable access to paid coaching, cloud AI, or stable internet. Vencer gives them a practical planning assistant that understands constraints, builds a plan, adapts after missed days, and keeps sensitive goals private.
@@ -165,4 +167,3 @@ android/app/build/outputs/apk/release/app-release.apk
 ## Legacy Server Note
 
 The `server/` folder contains an older remote AI proxy used before the app moved to local Gemma inference. The competition path for this project is the Android on-device Gemma 4 implementation.
-
