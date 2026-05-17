@@ -913,7 +913,9 @@ export function describeLocalAIProgress(progress: LocalAIProgress, taskLabel = '
   if (progress.state === 'initializing') {
     return {
       title: 'Preparing local AI...',
-      subtitle: 'The model is on device. Finishing native initialization now.',
+      subtitle: progress.downloaded
+        ? 'Gemma model downloaded. Finishing native initialization now.'
+        : 'Gemma is almost ready. Finishing native initialization now.',
     };
   }
 

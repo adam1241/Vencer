@@ -33,10 +33,10 @@ class GemmaLocalAiModule(
   companion object {
     private const val TAG = "GemmaLocalAi"
     private const val MODEL_URL =
-      "https://huggingface.co/litert-community/gemma-4-E4B-it-litert-lm/resolve/main/gemma-4-E4B-it.litertlm?download=true"
+      "https://huggingface.co/litert-community/gemma-4-E4B-it-litert-lm/resolve/28299f30ee4d43294517a4ac93abd6163412f07f/gemma-4-E4B-it.litertlm?download=true"
     private const val MODEL_FILE_NAME = "gemma-4-E4B-it.litertlm"
     private const val DIAGNOSTICS_FILE_NAME = "gemma_diagnostics.log"
-    private const val MIN_MODEL_BYTES = 3_000_000_000L
+    private const val EXPECTED_MODEL_BYTES = 3_659_530_240L
     private const val MIN_DEVICE_MEMORY_BYTES = 8L * 1024L * 1024L * 1024L
     private const val REQUIRED_FREE_BYTES = 5_200_000_000L
     private const val DEFAULT_MAX_TOKENS = 3000
@@ -46,6 +46,8 @@ class GemmaLocalAiModule(
     private const val DEFAULT_RANDOM_SEED = 101
     private const val DOWNLOAD_CONNECT_TIMEOUT_MS = 30_000
     private const val DOWNLOAD_READ_TIMEOUT_MS = 120_000
+    private const val ENABLE_IMAGE_INPUT = false
+    private const val ENABLE_AUDIO_INPUT = false
   }
 
   private val executor = Executors.newSingleThreadExecutor()
@@ -169,7 +171,7 @@ class GemmaLocalAiModule(
 
   private fun ensureDiskCapacity() {
     val modelFile = getModelFile()
-    if (modelFile.exists() && modelFile.length() >= MIN_MODEL_BYTES) {
+    if (isCompleteModelFile(modelFile)) {
       return
     }
 
@@ -184,7 +186,7 @@ class GemmaLocalAiModule(
 
   private fun downloadModelIfNeeded() {
     val modelFile = getModelFile()
-    if (modelFile.exists() && modelFile.length() >= MIN_MODEL_BYTES) {
+    if (isCompleteModelFile(modelFile)) {
       totalBytes = modelFile.length()
       downloadedBytes = modelFile.length()
       appendDiagnostic("downloadModelIfNeeded: existing model accepted (${modelFile.length()} bytes)")
@@ -193,6 +195,7 @@ class GemmaLocalAiModule(
 
     val tempFile = File(modelFile.parentFile, "$MODEL_FILE_NAME.part")
     modelFile.parentFile?.mkdirs()
+    recoverIncompleteFinalModel(modelFile, tempFile)
 
     state = "downloading"
     lastError = null
@@ -240,9 +243,9 @@ class GemmaLocalAiModule(
         }
       }
 
-      if (tempFile.length() < MIN_MODEL_BYTES) {
+      if (!isCompleteModelFile(tempFile)) {
         appendDiagnostic("downloadModelIfNeeded: partial download kept (${tempFile.length()} bytes)")
-        throw IllegalStateException("Gemma download is incomplete. Keep the app open with internet and try again.")
+        throw IllegalStateException("Gemma download is incomplete (${tempFile.length()} of $EXPECTED_MODEL_BYTES bytes). Keep the app open with internet and try again.")
       }
 
       if (modelFile.exists()) {
@@ -289,8 +292,8 @@ class GemmaLocalAiModule(
           EngineConfig(
             modelPath = modelPath,
             backend = backend,
-            visionBackend = Backend.GPU(),
-            audioBackend = Backend.CPU(),
+            visionBackend = if (ENABLE_IMAGE_INPUT) Backend.GPU() else null,
+            audioBackend = if (ENABLE_AUDIO_INPUT) Backend.CPU() else null,
             maxNumTokens = DEFAULT_MAX_TOKENS,
             cacheDir = cacheDir,
           ),
@@ -319,6 +322,37 @@ class GemmaLocalAiModule(
       lastFailure?.message ?: "Failed to initialize Gemma engine",
       lastFailure,
     )
+  }
+
+  private fun isCompleteModelFile(file: File): Boolean =
+    file.exists() && file.length() == EXPECTED_MODEL_BYTES
+
+  private fun recoverIncompleteFinalModel(modelFile: File, tempFile: File) {
+    if (!modelFile.exists()) return
+
+    val modelBytes = modelFile.length()
+    if (modelBytes == EXPECTED_MODEL_BYTES) return
+
+    appendDiagnostic(
+      "recoverIncompleteFinalModel: existing final file has unexpected size $modelBytes; expected $EXPECTED_MODEL_BYTES",
+    )
+
+    if (modelBytes in 1 until EXPECTED_MODEL_BYTES) {
+      if (!tempFile.exists() || tempFile.length() < modelBytes) {
+        if (tempFile.exists()) {
+          tempFile.delete()
+        }
+        if (modelFile.renameTo(tempFile)) {
+          appendDiagnostic("recoverIncompleteFinalModel: moved incomplete final file to partial download")
+          return
+        }
+      }
+    }
+
+    if (!modelFile.delete()) {
+      appendDiagnostic("recoverIncompleteFinalModel: could not delete unexpected final file")
+      throw IllegalStateException("Gemma model file is incomplete and could not be repaired. Clear app storage and try again.")
+    }
   }
 
   private fun getModelFile(): File =
@@ -355,13 +389,31 @@ class GemmaLocalAiModule(
   }
 
   private fun buildStatusMap() = Arguments.createMap().apply {
+    val modelFile = getModelFile()
+    val tempFile = File(modelFile.parentFile, "$MODEL_FILE_NAME.part")
+    val modelBytes = if (modelFile.exists()) modelFile.length() else 0L
+    val partialBytes = if (tempFile.exists()) tempFile.length() else 0L
+    val statusDownloadedBytes =
+      when {
+        modelBytes > 0L -> modelBytes
+        downloadedBytes > 0L -> downloadedBytes
+        partialBytes > 0L -> partialBytes
+        else -> 0L
+      }
+    val statusTotalBytes =
+      when {
+        totalBytes > 0L -> totalBytes
+        statusDownloadedBytes > 0L -> EXPECTED_MODEL_BYTES
+        else -> EXPECTED_MODEL_BYTES
+      }
+
     putString("state", state)
     putBoolean("ready", engine != null)
     putString("backend", backendName)
-    putString("modelPath", getModelFile().absolutePath)
-    putBoolean("downloaded", getModelFile().exists())
-    putDouble("downloadedBytes", downloadedBytes.toDouble())
-    putDouble("totalBytes", totalBytes.toDouble())
+    putString("modelPath", modelFile.absolutePath)
+    putBoolean("downloaded", isCompleteModelFile(modelFile))
+    putDouble("downloadedBytes", statusDownloadedBytes.toDouble())
+    putDouble("totalBytes", statusTotalBytes.toDouble())
     putString("lastError", lastError)
     putString("diagnosticsPath", getDiagnosticsFile().absolutePath)
   }
