@@ -58,6 +58,23 @@ const trackingLabel: Record<string, string> = {
 };
 
 const DAYS_OF_WEEK = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const GOAL_SETUP_QUESTIONS = [
+  'What do you want to achieve?',
+  'Why is this goal important to you?',
+  'What is your current level?',
+  'What are you currently doing or working on for this goal? (tasks, tools, routines — anything you already do)',
+  'Do you have a target date to achieve this goal?',
+  'How would you like reminders?',
+  'How challenging should the plan be?',
+  'Which days do you want to work on this?',
+  'Anything that might limit you?',
+];
+
+const getTomorrow = () => {
+  const date = new Date();
+  date.setDate(date.getDate() + 1);
+  return date;
+};
 
 export default function OnboardingScreen() {
   const router = useRouter();
@@ -82,7 +99,7 @@ export default function OnboardingScreen() {
   const [trackingMode, setTrackingMode] = useState<TrackingMode>('points');
   const [trackingTarget, setTrackingTarget] = useState('10');
   const [deadlineBased, setDeadlineBased] = useState(false);
-  const [deadlineDate, setDeadlineDate] = useState<Date>(new Date());
+  const [deadlineDate, setDeadlineDate] = useState<Date>(getTomorrow());
   const [showDatePicker, setShowDatePicker] = useState(false);
   const [notificationPref, setNotificationPref] = useState<OnboardingProfile['notificationPreference'] | ''>('');
   const [difficulty, setDifficulty] = useState<OnboardingProfile['difficulty'] | ''>('');
@@ -135,6 +152,67 @@ export default function OnboardingScreen() {
     setMessages((prev) => [...prev, { id: `u-${Date.now()}`, role: 'user', text }]);
   };
 
+  const getAnswerForStep = (step: number) => {
+    if (step === 0) return goal;
+    if (step === 1) return motivation;
+    if (step === 2) return currentSituation;
+    if (step === 3) return currentActivities || 'Nothing yet';
+    if (step === 4) return deadlineBased ? deadlineDate.toISOString().split('T')[0] : 'No / Flexible';
+    if (step === 5) return notificationPref === 'Specific times'
+      ? (specificTimes.length > 0 ? specificTimes.join(', ') : 'No specific times')
+      : notificationPref;
+    if (step === 6) return difficulty;
+    if (step === 7) return preferredDays === 'Custom'
+      ? (customDays.length > 0 ? customDays.join(', ') : 'No specific days')
+      : preferredDays;
+    if (step === 8) return constraints || 'No specific limits.';
+    return '';
+  };
+
+  const buildMessagesThroughStep = (targetStep: number) => {
+    const rebuilt: typeof messages = [];
+    for (let step = 0; step <= targetStep; step += 1) {
+      rebuilt.push({ id: `q-${step}`, role: 'assistant', text: GOAL_SETUP_QUESTIONS[step] });
+      if (step < targetStep) {
+        const answer = getAnswerForStep(step);
+        if (answer) rebuilt.push({ id: `u-${step}`, role: 'user', text: answer });
+      }
+    }
+    return rebuilt;
+  };
+
+  const getInputForStep = (step: number) => {
+    if (step === 0) return goal;
+    if (step === 1) return motivation;
+    if (step === 2) return currentSituation;
+    if (step === 3) return currentActivities;
+    if (step === 8) return constraints;
+    return '';
+  };
+
+  const clearFromStep = (step: number) => {
+    if (step <= 0) setGoal('');
+    if (step <= 1) setMotivation('');
+    if (step <= 2) setCurrentSituation('');
+    if (step <= 3) setCurrentActivities('');
+    if (step <= 4) {
+      setDeadlineBased(false);
+      setDeadlineDate(getTomorrow());
+      setShowDatePicker(false);
+    }
+    if (step <= 5) {
+      setNotificationPref('');
+      setSpecificTimes([]);
+      setShowTimePicker(false);
+    }
+    if (step <= 6) setDifficulty('');
+    if (step <= 7) {
+      setPreferredDays('');
+      setCustomDays([]);
+    }
+    if (step <= 8) setConstraints('');
+  };
+
   const goToNextStep = (nextQuestion?: string) => {
     if (nextQuestion) {
       pushAssistant(nextQuestion);
@@ -144,20 +222,14 @@ export default function OnboardingScreen() {
 
   const handleBack = () => {
     if (currentStep > 0) {
+        const nextStep = currentStep - 1;
+        const nextInput = getInputForStep(nextStep);
+        const rebuiltMessages = buildMessagesThroughStep(nextStep);
         LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
-        setMessages((prev) => {
-            const newMsgs = [...prev];
-            // Remove last assistant message (current question)
-            if (newMsgs.length > 0 && newMsgs[newMsgs.length - 1].role === 'assistant') {
-                newMsgs.pop();
-            }
-            // Remove last user answer
-            if (newMsgs.length > 0 && newMsgs[newMsgs.length - 1].role === 'user') {
-                newMsgs.pop();
-            }
-            return newMsgs;
-        });
-        setCurrentStep((prev) => prev - 1);
+        clearFromStep(nextStep);
+        setCustomInput(nextInput);
+        setMessages(rebuiltMessages);
+        setCurrentStep(nextStep);
     }
   };
 
@@ -226,15 +298,19 @@ export default function OnboardingScreen() {
   // 7. Deadline
   const handleDueSelect = (value: boolean) => {
     setDeadlineBased(value);
-    pushUser(value ? 'Yes' : 'No / Flexible');
     if (value) {
       setShowDatePicker(true);
     } else {
+      pushUser('No / Flexible');
       goToNextStep('How would you like reminders?');
     }
   };
 
-  const handleDateChange = (_event: unknown, selected?: Date) => {
+  const handleDateChange = (event: any, selected?: Date) => {
+    if (event?.type === 'dismissed') {
+      setShowDatePicker(false);
+      return;
+    }
     const nextDate = selected || deadlineDate;
     if (selected) {
       setDeadlineDate(selected);
@@ -733,6 +809,7 @@ export default function OnboardingScreen() {
                   value={deadlineDate}
                   mode="date"
                   display="default"
+                  minimumDate={getTomorrow()}
                   onChange={handleDateChange}
                 />
               ) : null}

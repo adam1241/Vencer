@@ -2,7 +2,7 @@
   "expo": {
     "name": "Vencer",
     "slug": "Ziel",
-    "version": "0.1.2",
+    "version": "0.1.4",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "scheme": "ziel",

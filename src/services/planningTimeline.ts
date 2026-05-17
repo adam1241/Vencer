@@ -11,7 +11,7 @@ export type PlanningTimeline = {
 function clampTimelineCount(value: number, unit: PlanningTimelineUnit) {
   if (unit === 'day') return Math.max(1, Math.min(value, 14));
   if (unit === 'week') return Math.max(1, Math.min(value, 12));
-  return Math.max(1, Math.min(value, 36));
+  return Math.max(1, Math.min(value, 60));
 }
 
 function diffDays(startIso: string, endIso: string) {
@@ -24,7 +24,7 @@ function diffDays(startIso: string, endIso: string) {
 function inferFallbackMonths(goalName: string) {
   const text = String(goalName || '').toLowerCase();
   if (/(quran|qur'an|surah|surat|ayah|ayat|juz|tajweed|hifz|recit|islam|prayer|pray)/.test(text)) return 12;
-  if (/(language|spanish|french|german|japanese|chinese|fluency|speaking|conversation)/.test(text)) return 12;
+  if (/(language|spanish|french|german|russian|italian|portuguese|arabic|korean|japanese|chinese|fluency|speaking|conversation)/.test(text)) return 12;
   if (/(sleep|bedtime|wake up|wakeup|circadian|insomnia)/.test(text)) return 3;
   if (/(weight loss|lose fat|lose weight|fitness|strength|muscle|gym|run|running|workout|exercise)/.test(text)) return 6;
   if (/(exam|course|certification|study|school|university|math|physics|biology|history)/.test(text)) return 6;
@@ -94,8 +94,8 @@ export function getTimelineDetailUnit(unit: PlanningTimelineUnit) {
 }
 
 export function getTimelineDetailCount(timeline: PlanningTimeline) {
-  if (timeline.unit === 'day') return timeline.count;
-  if (timeline.unit === 'week') return timeline.count <= 8 ? timeline.count : 4;
+  if (timeline.unit === 'day') return Math.min(timeline.count, 4);
+  if (timeline.unit === 'week') return Math.min(timeline.count, 4);
   return 4;
 }
 

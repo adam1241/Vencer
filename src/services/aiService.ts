@@ -89,6 +89,7 @@ const VENCER_PERSONA =
 export const GEMMA_MODEL_LABEL = 'Gemma 4 E4B';
 const GEMMA_OUTPUT_TOKEN_LIMIT = 3000;
 const INITIAL_DETAILED_WEEKS = 4;
+const MAX_OVERVIEW_MILESTONES_TO_REQUEST = 12;
 export const DEFAULT_ASSUMED_TIME_BUDGET_MINUTES = 25;
 export const DEFAULT_ASSUMED_SCHEDULE_LABEL = 'Flexible 3 days / week';
 
@@ -234,6 +235,48 @@ function buildPromptTimelineContext(
     daysUntilDeadline: baseTimeline.daysUntilDeadline,
     weeksUntilDeadline: baseTimeline.weeksUntilDeadline,
     monthsUntilDeadline: baseTimeline.monthsUntilDeadline,
+  };
+}
+
+function getOverviewMilestoneOutputCount(timeline: Pick<PlanningTimeline, 'unit' | 'count'>) {
+  const count = Math.max(1, Number(timeline.count) || 1);
+  if (timeline.unit === 'day') return Math.min(count, 14);
+  if (timeline.unit === 'week') return Math.min(count, 12);
+  return Math.min(count, MAX_OVERVIEW_MILESTONES_TO_REQUEST);
+}
+
+function shouldPreferMonthMilestonesForNoDeadline(goalName: string, timeline: PlanningTimeline) {
+  if (timeline.daysUntilDeadline !== null) return false;
+  if (timeline.unit !== 'month') return false;
+  const domain = inferGoalDomain(goalName);
+  return ['language', 'fitness', 'strategy', 'spiritual', 'coding', 'study'].includes(domain);
+}
+
+function clampAIChosenTimelineCount(value: unknown, unit: PlanningTimelineUnit, fallbackCount: number) {
+  const numeric = Number(value) || fallbackCount || 1;
+  if (unit === 'day') return Math.max(1, Math.min(Math.round(numeric), 14));
+  if (unit === 'week') return Math.max(1, Math.min(Math.round(numeric), 12));
+  return Math.max(1, Math.min(Math.round(numeric), 60));
+}
+
+function applyTimelinePolicyToOverview(
+  goalName: string,
+  overview: AIPlanOverviewResult | null,
+  timeline: PlanningTimeline,
+) {
+  if (!overview) return overview;
+  if (!shouldPreferMonthMilestonesForNoDeadline(goalName, timeline)) return overview;
+  const chosenCount = clampAIChosenTimelineCount(
+    overview.timelineCount || overview.planHorizonMonths || overview.milestones?.length,
+    'month',
+    timeline.count,
+  );
+
+  return {
+    ...overview,
+    planHorizonMonths: chosenCount,
+    timelineUnit: 'month' as const,
+    timelineCount: chosenCount,
   };
 }
 
@@ -396,7 +439,7 @@ function inferGoalDomain(goalName: string): GoalDomain {
   if (/(sleep|bedtime|wake up on time|wake up|wakeup|circadian|insomnia|sleep schedule)/.test(text)) {
     return 'sleep';
   }
-  if (/(chinese|japanese|spanish|french|german|language|vocabulary|grammar|speaking|fluency|conversation)/.test(text)) {
+  if (/(chinese|japanese|korean|russian|spanish|french|german|italian|portuguese|arabic|language|vocabulary|grammar|speaking|fluency|conversation)/.test(text)) {
     return 'language';
   }
   if (/(gym|workout|fitness|strength|run|running|marathon|weight|muscle|cardio|exercise)/.test(text)) {
@@ -1258,6 +1301,53 @@ function repairJSONCandidate(text: string | null | undefined) {
   return stripTrailingCommasOutsideStrings(escapeLineBreaksInsideStrings(text)).trim();
 }
 
+function completePartialJSONCandidate(text: string | null | undefined) {
+  const repaired = repairJSONCandidate(text);
+  if (!repaired) return null;
+
+  const start = repaired.indexOf('{');
+  if (start < 0) return null;
+
+  let output = repaired.slice(start).trim();
+  const closingStack: string[] = [];
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < output.length; index += 1) {
+    const char = output[index];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+    } else if (char === '{') {
+      closingStack.push('}');
+    } else if (char === '[') {
+      closingStack.push(']');
+    } else if ((char === '}' || char === ']') && closingStack[closingStack.length - 1] === char) {
+      closingStack.pop();
+    }
+  }
+
+  if (inString) output += '"';
+  output = stripTrailingCommasOutsideStrings(output);
+
+  if (closingStack.length > 0) {
+    output += closingStack.reverse().join('');
+  }
+
+  return stripTrailingCommasOutsideStrings(output).trim();
+}
+
 function tryParseJSON<T>(text: string | null | undefined): T | null {
   if (!text) return null;
 
@@ -1267,7 +1357,14 @@ function tryParseJSON<T>(text: string | null | undefined): T | null {
   const jsonMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/);
   const raw = (jsonMatch ? jsonMatch[1] : cleaned).trim();
   const extracted = extractBalancedJSONObject(raw);
-  const candidates = [raw, extracted, repairJSONCandidate(raw), repairJSONCandidate(extracted)].filter(
+  const candidates = [
+    raw,
+    extracted,
+    repairJSONCandidate(raw),
+    repairJSONCandidate(extracted),
+    completePartialJSONCandidate(raw),
+    completePartialJSONCandidate(extracted),
+  ].filter(
     (candidate, index, list): candidate is string =>
       Boolean(candidate) && list.indexOf(candidate) === index,
   );
@@ -1496,10 +1593,13 @@ function normalizeMilestones(
       items[index] ||
       null;
     const fallback = buildFallbackMilestone(monthNumber, targetStages, goalName, timelineUnit);
+    const sourceTitle = String(existing?.title || '').trim();
+    const titleLooksLikeWrongUnit =
+      timelineUnit === 'month' && /^(day|week)\s+\d+\b/i.test(sourceTitle);
 
     normalized.push({
       month: monthNumber,
-      title: String(existing?.title || fallback.title).trim() || fallback.title,
+      title: titleLooksLikeWrongUnit ? fallback.title : sourceTitle || fallback.title,
       focus: looksVagueMilestoneFocus(String(existing?.focus || '').trim())
         ? fallback.focus
         : String(existing?.focus || fallback.focus).trim(),
@@ -1738,7 +1838,12 @@ function normalizePlan(
   } = {},
 ) {
   const fallbackTimeline = meta.timeline || buildPlanTimeline(goalName, null);
-  const timelineUnit = (plan?.timelineUnit || plan?.goal?.aiTimelineUnit || fallbackTimeline.unit) as PlanningTimelineUnit;
+  const preferMonthTimeline = shouldPreferMonthMilestonesForNoDeadline(goalName, fallbackTimeline);
+  const timelineUnit = (
+    preferMonthTimeline
+      ? 'month'
+      : plan?.timelineUnit || plan?.goal?.aiTimelineUnit || fallbackTimeline.unit
+  ) as PlanningTimelineUnit;
   const requestedStages = Math.max(
     Number(plan?.planHorizonMonths) || 0,
     Number(plan?.timelineCount) || 0,
@@ -1817,9 +1922,17 @@ function buildGemmaPrompt(task: string, payload: unknown) {
   ].join('\n');
 }
 
-const PLANNING_OVERVIEW_TASK = `Create the long-horizon overview for a habit app. Keep it realistic, personalized, concise, and action-oriented. planTitle must be simple, 2-3 words max. Choose one accurate single emoji for goalEmoji that matches the goal well. goalSummary must describe the final visualized stage, not the next step. If context.timeline.deadlineProvided is true, use context.timeline.suggestedUnit and context.timeline.suggestedCount as a hard planning anchor. If context.timeline.deadlineProvided is false, do not assume a fake deadline: choose the most suitable timelineUnit and timelineCount yourself based on the goal, constraints, and realism. In that case, context.timeline.suggestedUnit and suggestedCount are only soft hints, not hard limits. If timelineUnit is day, the milestones must be day-by-day. If timelineUnit is week, the milestones must be week-by-week. If timelineUnit is month, the milestones must be month-by-month. The schema keeps the numeric field name month even when the real unit is day or week, so use month as the stage index only. Do not invent extra months when the deadline is only a few days or weeks away. Each milestone title and focus must say what the user will tangibly do or achieve in that exact stage, not vague labels like growth, progress, or mastery. Respect the actual topic exactly: fitness or weight loss goals must stay in training, movement, food, and recovery language; sleep goals must stay in bedtime, wake-up, wind-down, and sleep-environment language; chess goals must stay in puzzles, games, openings, endgames, and review; spiritual or Quran goals must stay in recitation, memorization, prayer, or review language. If difficulty is Easy, keep expectations simple and low-friction. Use context.planningAssumptions as hard limits when time or schedule is missing. If no explicit timing or schedule was provided, stay modest and low-load rather than assuming daily high availability. Return JSON with only: planTitle, goalEmoji, goalSummary, realismNote, northStar, planHorizonMonths, timelineUnit, timelineCount, milestones[{month,title,focus}], ifThenRules[{trigger,response}], recommendedTools[{name,description,isFree}]. Do not include weeklyFocus or dayRoutines in this step.`;
+const PLANNING_OVERVIEW_TASK = `Create the long-horizon overview for a habit app. Keep it realistic, personalized, concise, and action-oriented. planTitle must be simple, 2-3 words max. Choose one accurate single emoji for goalEmoji. goalSummary must describe the final visualized stage, not the next step. If context.timeline.deadlineProvided is true, use context.timeline.suggestedUnit and context.timeline.suggestedCount as a hard planning anchor. If context.timeline.deadlineProvided is false, do not assume a fake deadline: choose timelineUnit and timelineCount yourself based on the goal, constraints, current level, difficulty, available time, and realism. If context.timeline.preferMonthMilestones is true, prefer timelineUnit month for broad long-term goals, but choose the month count yourself; use fewer months for simple/easy goals, more months for ambitious goals, and 24+ months only when realistic. timelineCount is the full horizon. milestones must contain exactly context.timeline.milestoneOutputCount entries for stages 1 to milestoneOutputCount only, even when timelineCount is larger. If timelineUnit is day, those milestones are day-by-day. If timelineUnit is week, they are week-by-week. If timelineUnit is month, they are month-by-month. The schema keeps the numeric field name month even when the real unit is day or week, so use month as the stage index only. Do not invent extra months when the deadline is only a few days or weeks away. Each milestone title and focus must say what the user will tangibly do or achieve in that exact stage, not vague labels like growth, progress, or mastery. Respect the actual topic exactly: fitness or weight loss goals must stay in training, movement, food, and recovery language; sleep goals must stay in bedtime, wake-up, wind-down, and sleep-environment language; chess goals must stay in puzzles, games, openings, endgames, and review; spiritual or Quran goals must stay in recitation, memorization, prayer, or review language; language goals such as Russian, Spanish, French, German, Arabic, Chinese, Japanese, Korean, Italian, or Portuguese must use vocabulary, listening, speaking, reading, grammar, and conversation practice language. If difficulty is Easy, keep expectations simple and low-friction. If no explicit timing or schedule was provided, stay modest and low-load. Return JSON with only: planTitle, goalEmoji, goalSummary, realismNote, northStar, planHorizonMonths, timelineUnit, timelineCount, milestones[{month,title,focus}], ifThenRules[{trigger,response}], recommendedTools[{name,description,isFree}]. Do not include weeklyFocus or dayRoutines.`;
 
-const MONTH_ONE_DETAILS_TASK = `Create only the detailed starter layer for the plan. The roadmap already exists. Return JSON with only: weeklyFocus, dayRoutines, continuationNote, detailedWeeksThrough, timelineUnit, timelineCount. Use overviewPlan.timelineUnit and overviewPlan.timelineCount as the chosen roadmap. Use context.timeline.detailUnit and context.timeline.detailCount as the number of starter entries to generate. If detailUnit is day, create exactly detailCount weeklyFocus entries representing day 1 to day N. If detailUnit is week, create exactly detailCount weeklyFocus entries representing week 1 to week N. The schema keeps the numeric field name week even when the real unit is day, so use week as the sequence index only. If the overall timeline is month-based, these detailed entries are the first 4 weeks of month 1 only. Each focus title, objective, and successSignal must be strategically different and tangible. Each weeklyFocus must include exactly 1 light task, 2 standard tasks, and 3 or 4 intense tasks. Every task must be one real-world action a person can do in one session. Avoid vague tasks like set up, work on the goal, make progress, focused session, or review what you learned. Respect the topic exactly: fitness or weight loss goals must stay in movement, workouts, food structure, or recovery; sleep goals must stay in bedtime, wind-down, wake-up, or sleep-environment actions; chess goals must stay in puzzles, games, opening review, or endgame review; spiritual goals must stay in memorization, recitation, prayer, or review. If no explicit timing or schedule was provided, use context.planningAssumptions and keep the daily layer especially modest and realistic. dayRoutines must include exactly 3 routines: light, standard, and intense. dayRoutines must show only example activities for the first day of the plan, not a full week schedule. Light Day = 1 activity, Standard Day = 2 activities, Intense Day = 3 or 4 activities. Every day-routine habit title must be a tangible one-session action, preferably starting with a verb and including the exact thing to do, quantity, or method. If a title could describe a category instead of a session, rewrite it until it becomes one clear session the user can do immediately. Every day-routine habit must include duration in minutes, coins, type, tool, and a reward mentioning coins. tool should explain how to do the habit in a practical way, like the resource, setup, or method to use. Do not use cue. continuationNote must clearly say that later detailed stages can be generated or refined as the user progresses. detailedWeeksThrough must equal context.timeline.detailCount.`;
+const PLANNING_OVERVIEW_REPAIR_TASK = `Return a smaller valid JSON overview only. Use short strings. Choose timelineUnit and timelineCount realistically from the context. If a deadline was provided, timelineUnit and timelineCount must match context.timeline.suggestedUnit and context.timeline.suggestedCount. milestones must have exactly context.timeline.milestoneOutputCount entries for stages 1 to milestoneOutputCount only. Return only: planTitle, goalEmoji, goalSummary, realismNote, northStar, planHorizonMonths, timelineUnit, timelineCount, milestones, ifThenRules, recommendedTools. No markdown.`;
+
+const MONTH_ONE_DETAILS_TASK = `Create only the starter week/day sequence for the plan. The roadmap already exists. Return JSON with only: weeklyFocus, continuationNote, detailedWeeksThrough, timelineUnit, timelineCount. Use overviewPlan.timelineUnit and overviewPlan.timelineCount as the chosen roadmap. Use context.timeline.detailUnit and context.timeline.detailCount as the number of starter entries to generate. If detailUnit is day, create exactly detailCount weeklyFocus entries representing day 1 to day N. If detailUnit is week, create exactly detailCount weeklyFocus entries representing week 1 to week N. The schema keeps the numeric field name week even when the real unit is day, so use week as the sequence index only. If the overall timeline is month-based, these detailed entries are the first 4 weeks of month 1 only. Each focus, objective, and successSignal must be strategically different and tangible. Each weeklyFocus must include exactly 1 light task, 2 standard tasks, and 3 intense tasks. Every task must be one real-world action a person can do in one session. Avoid vague tasks like set up, work on the goal, make progress, focused session, practice session, or review what you learned. Respect the topic exactly: fitness or weight loss goals must stay in movement, workouts, food structure, or recovery; sleep goals must stay in bedtime, wind-down, wake-up, or sleep-environment actions; chess goals must stay in puzzles, games, opening review, or endgame review; spiritual goals must stay in memorization, recitation, prayer, or review; language goals must stay in vocabulary, listening, speaking, reading, grammar, or conversation. If no explicit timing or schedule was provided, use context.planningAssumptions and keep the workload modest. continuationNote must clearly say that later detailed stages can be generated or refined as the user progresses. detailedWeeksThrough must equal context.timeline.detailCount. Do not include dayRoutines.`;
+
+const MONTH_ONE_REPAIR_TASK = `Your previous starter sequence was not usable JSON. Return a smaller valid JSON object only. Use short strings. Return only: weeklyFocus, continuationNote, detailedWeeksThrough, timelineUnit, timelineCount. weeklyFocus must have exactly context.timeline.detailCount entries. Each entry needs: week, focus, objective, successSignal, lightTasks, standardTasks, intenseTasks. lightTasks has 1 concrete action, standardTasks has 2 concrete actions, intenseTasks has 3 concrete actions. Keep every title tangible and topic-specific. Do not use generic titles like focused session, practice session, work on goal, review what you learned, or make progress. Return no markdown.`;
+
+const DAY_ROUTINES_TASK = `Create only the first-day routine examples for the plan. The roadmap and starter sequence already exist. Return JSON with only: dayRoutines. dayRoutines must include exactly 3 routines with ids light, standard, intense. Light Day = 1 activity, Standard Day = 2 activities, Intense Day = 3 activities. Every habit title must be a tangible one-session action, preferably starting with a verb and including the exact thing to do, quantity, or method. Fitness or weight loss goals must use workouts, walks, food structure, or recovery actions. Sleep goals must use bedtime, wind-down, wake-up, or sleep-environment actions. Chess goals must use puzzles, games, openings, endgames, or review actions. Spiritual or Quran goals must use recitation, memorization, prayer, or review actions. Language goals must use words, listening, speaking, reading, grammar, or conversation actions. If difficulty is Easy or no schedule was provided, keep the activities low-friction. Each habit must include title, duration, type, tool, and reward. Do not use cue. No weeklyFocus. No markdown.`;
+
+const DAY_ROUTINES_REPAIR_TASK = `Your previous day-routines answer was not usable JSON. Return a smaller valid JSON object only with dayRoutines. Include exactly 3 routines: light, standard, intense. Habits need only title and duration; the app fills coins, type, tool, and reward. Light has 1 habit, standard has 2 habits, intense has 3 habits. Titles must be concrete and topic-specific. No markdown.`;
 
 const REFINEMENT_PATCH_TASK = `You are refining an existing plan. Return one valid JSON object only. Use the smallest possible patch instead of rewriting the whole plan. Allowed target values: replace_overview, replace_milestones, replace_weeks, replace_routines, replace_supporting, replace_multiple. Respect the exact goal topic and difficulty. Fitness or weight loss goals must stay in workout, movement, food structure, and recovery language. Sleep goals must stay in bedtime, wake-up, wind-down, and sleep-environment language. Chess goals must stay in puzzles, games, openings, endgames, and review. Spiritual or Quran goals must stay in recitation, memorization, prayer, or review language. If difficulty is Easy, keep changes simple and low-friction. If the original plan had no explicit timing or schedule, keep refinements modest and realistic instead of expanding the load. If the plan has no deadline, preserve the current chosen horizon unless the user clearly asks to change it. Return JSON with: target, reason, and only the fields that need changing from this schema: planTitle, goalEmoji, goalSummary, realismNote, northStar, planHorizonMonths, timelineUnit, timelineCount, milestones[{month,title,focus}], weeklyFocus[{week,focus,objective,successSignal,lightTasks,standardTasks,intenseTasks}], dayRoutines[{id,title,habits[{id,title,duration,coins,type,tool,reward}]}], ifThenRules[{trigger,response}], recommendedTools[{name,description,isFree}], continuationNote, detailedWeeksThrough. If the request is about routines, return only dayRoutines. If the request is about milestones or horizon, return milestones, planHorizonMonths, timelineUnit, and timelineCount only. Preserve unchanged sections by omitting them.`;
 
@@ -1843,9 +1956,63 @@ function buildPlanningOverviewPrompt(context: Record<string, unknown>) {
         deadlineProvided: timeline.deadlineProvided,
         suggestedUnit: timeline.suggestedUnit,
         suggestedCount: timeline.suggestedCount,
+        preferMonthMilestones: shouldPreferMonthMilestonesForNoDeadline(String(context.goalName || ''), {
+          unit: timeline.suggestedUnit,
+          count: timeline.suggestedCount,
+          daysUntilDeadline: timeline.daysUntilDeadline,
+          weeksUntilDeadline: timeline.weeksUntilDeadline,
+          monthsUntilDeadline: timeline.monthsUntilDeadline,
+        }),
+        milestoneOutputCount: getOverviewMilestoneOutputCount({
+          unit: timeline.suggestedUnit,
+          count: timeline.suggestedCount,
+        }),
         daysUntilDeadline: timeline.daysUntilDeadline,
         weeksUntilDeadline: timeline.weeksUntilDeadline,
         monthsUntilDeadline: timeline.monthsUntilDeadline,
+      },
+    },
+  });
+}
+
+function buildPlanningOverviewRepairPrompt(context: Record<string, unknown>) {
+  const timeline = buildPromptTimelineContext(
+    String(context.goalName || ''),
+    (context.deadline as string | null | undefined) || null,
+  );
+  const planningAssumptions = buildAvailabilityAssumptions({
+    timeBudgetMinutes: context.timeBudgetMinutes,
+    preferredDays: context.preferredDays,
+    customDays: context.customDays,
+  });
+
+  return buildGemmaPrompt(PLANNING_OVERVIEW_REPAIR_TASK, {
+    context: {
+      goalName: context.goalName,
+      motivation: context.motivation,
+      currentSituation: context.currentSituation,
+      currentActivities: context.currentActivities,
+      difficulty: context.difficulty,
+      constraints: context.constraints,
+      stylePreference: context.stylePreference,
+      planningAssumptions,
+      timeBudgetMinutes: planningAssumptions.effectiveTimeBudgetMinutes,
+      goalDomain: inferGoalDomain(String(context.goalName || '')),
+      timeline: {
+        deadlineProvided: timeline.deadlineProvided,
+        suggestedUnit: timeline.suggestedUnit,
+        suggestedCount: timeline.suggestedCount,
+        preferMonthMilestones: shouldPreferMonthMilestonesForNoDeadline(String(context.goalName || ''), {
+          unit: timeline.suggestedUnit,
+          count: timeline.suggestedCount,
+          daysUntilDeadline: timeline.daysUntilDeadline,
+          weeksUntilDeadline: timeline.weeksUntilDeadline,
+          monthsUntilDeadline: timeline.monthsUntilDeadline,
+        }),
+        milestoneOutputCount: getOverviewMilestoneOutputCount({
+          unit: timeline.suggestedUnit,
+          count: timeline.suggestedCount,
+        }),
       },
     },
   });
@@ -1884,6 +2051,132 @@ function buildMonthOnePrompt(
       },
     },
     overviewPlan: prunePromptValue(overview) ?? null,
+  });
+}
+
+function buildMonthOneRepairPrompt(
+  context: Record<string, unknown>,
+  overview: AIPlanOverviewResult | null,
+) {
+  const timeline = buildPromptTimelineContext(
+    String(context.goalName || ''),
+    (context.deadline as string | null | undefined) || null,
+    overview,
+  );
+  const planningAssumptions = buildAvailabilityAssumptions({
+    timeBudgetMinutes: context.timeBudgetMinutes,
+    preferredDays: context.preferredDays,
+    customDays: context.customDays,
+  });
+
+  return buildGemmaPrompt(MONTH_ONE_REPAIR_TASK, {
+    context: {
+      goalName: context.goalName,
+      motivation: context.motivation,
+      currentSituation: context.currentSituation,
+      currentActivities: context.currentActivities,
+      difficulty: context.difficulty,
+      constraints: context.constraints,
+      stylePreference: context.stylePreference,
+      planningAssumptions,
+      timeBudgetMinutes: planningAssumptions.effectiveTimeBudgetMinutes,
+      goalDomain: inferGoalDomain(String(context.goalName || '')),
+      timeline: {
+        deadlineProvided: timeline.deadlineProvided,
+        chosenUnit: timeline.chosenUnit,
+        chosenCount: timeline.chosenCount,
+        detailUnit: timeline.detailUnit,
+        detailCount: timeline.detailCount,
+      },
+    },
+    overviewPlan: prunePromptValue({
+      planTitle: overview?.planTitle,
+      goalSummary: overview?.goalSummary,
+      northStar: overview?.northStar,
+      timelineUnit: overview?.timelineUnit,
+      timelineCount: overview?.timelineCount,
+      milestones: overview?.milestones,
+    }) ?? null,
+  });
+}
+
+function buildDayRoutinesPrompt(
+  context: Record<string, unknown>,
+  overview: AIPlanOverviewResult | null,
+  weeklyPlan: Pick<AIPlanDetailsResult, 'weeklyFocus' | 'continuationNote' | 'detailedWeeksThrough'> | null,
+) {
+  const timeline = buildPromptTimelineContext(
+    String(context.goalName || ''),
+    (context.deadline as string | null | undefined) || null,
+    overview,
+  );
+  const planningAssumptions = buildAvailabilityAssumptions({
+    timeBudgetMinutes: context.timeBudgetMinutes,
+    preferredDays: context.preferredDays,
+    customDays: context.customDays,
+  });
+
+  return buildGemmaPrompt(DAY_ROUTINES_TASK, {
+    context: {
+      goalName: context.goalName,
+      motivation: context.motivation,
+      currentSituation: context.currentSituation,
+      currentActivities: context.currentActivities,
+      difficulty: context.difficulty,
+      constraints: context.constraints,
+      stylePreference: context.stylePreference,
+      planningAssumptions,
+      timeBudgetMinutes: planningAssumptions.effectiveTimeBudgetMinutes,
+      goalDomain: inferGoalDomain(String(context.goalName || '')),
+      timeline: {
+        chosenUnit: timeline.chosenUnit,
+        chosenCount: timeline.chosenCount,
+        detailUnit: timeline.detailUnit,
+        detailCount: timeline.detailCount,
+      },
+    },
+    overviewPlan: prunePromptValue({
+      planTitle: overview?.planTitle,
+      goalSummary: overview?.goalSummary,
+      northStar: overview?.northStar,
+      timelineUnit: overview?.timelineUnit,
+      timelineCount: overview?.timelineCount,
+      firstMilestone: overview?.milestones?.[0],
+    }) ?? null,
+    starterSequence: prunePromptValue({
+      weeklyFocus: weeklyPlan?.weeklyFocus?.slice(0, 2),
+      detailedWeeksThrough: weeklyPlan?.detailedWeeksThrough,
+    }) ?? null,
+  });
+}
+
+function buildDayRoutinesRepairPrompt(
+  context: Record<string, unknown>,
+  overview: AIPlanOverviewResult | null,
+  weeklyPlan: Pick<AIPlanDetailsResult, 'weeklyFocus' | 'detailedWeeksThrough'> | null,
+) {
+  const planningAssumptions = buildAvailabilityAssumptions({
+    timeBudgetMinutes: context.timeBudgetMinutes,
+    preferredDays: context.preferredDays,
+    customDays: context.customDays,
+  });
+
+  return buildGemmaPrompt(DAY_ROUTINES_REPAIR_TASK, {
+    context: {
+      goalName: context.goalName,
+      difficulty: context.difficulty,
+      constraints: context.constraints,
+      planningAssumptions,
+      timeBudgetMinutes: planningAssumptions.effectiveTimeBudgetMinutes,
+      goalDomain: inferGoalDomain(String(context.goalName || '')),
+    },
+    overviewPlan: prunePromptValue({
+      planTitle: overview?.planTitle,
+      firstMilestone: overview?.milestones?.[0],
+    }) ?? null,
+    starterSequence: prunePromptValue({
+      weeklyFocus: weeklyPlan?.weeklyFocus?.slice(0, 1),
+    }) ?? null,
   });
 }
 
@@ -2087,6 +2380,26 @@ function applyAIPlanPatch(
   });
 }
 
+function hasUsablePlanDetails(details: AIPlanDetailsResult | null | undefined) {
+  return hasUsableWeeklyFocus(details) && hasUsableDayRoutines(details);
+}
+
+function hasUsableWeeklyFocus(details: Pick<AIPlanDetailsResult, 'weeklyFocus'> | null | undefined) {
+  return Boolean(
+    details &&
+      Array.isArray(details.weeklyFocus) &&
+      details.weeklyFocus.length > 0,
+  );
+}
+
+function hasUsableDayRoutines(details: Pick<AIPlanDetailsResult, 'dayRoutines'> | null | undefined) {
+  return Boolean(
+    details &&
+      Array.isArray(details.dayRoutines) &&
+      details.dayRoutines.length > 0,
+  );
+}
+
 export async function generateAIPlan(params: {
   goalName: string;
   motivation?: string;
@@ -2111,61 +2424,81 @@ export async function generateAIPlan(params: {
     Number(planningParams.timeBudgetMinutes) || DEFAULT_ASSUMED_TIME_BUDGET_MINUTES;
   const timeline = buildPlanTimeline(planningParams.goalName, planningParams.deadline);
   const overviewPrompt = buildPlanningOverviewPrompt(planningParams);
+  let overviewRepairPrompt: string | null = null;
   let overviewRaw = await callLocalModel(overviewPrompt, onLocalAIProgress, {
     required: requireLocalAI,
   });
   let overviewParsed = tryParseJSON<AIPlanOverviewResult>(overviewRaw);
 
-  if (!overviewParsed && requireLocalAI && overviewRaw) {
-    console.log('[aiService] Retrying Gemma planning overview after invalid JSON.');
-    overviewRaw = await callLocalModel(overviewPrompt, onLocalAIProgress, {
-      required: true,
+  if (!overviewParsed) {
+    console.log('[aiService] Retrying Gemma planning overview with compact repair prompt.');
+    overviewRepairPrompt = buildPlanningOverviewRepairPrompt(planningParams);
+    overviewRaw = await callLocalModel(overviewRepairPrompt, onLocalAIProgress, {
+      required: requireLocalAI,
     });
     overviewParsed = tryParseJSON<AIPlanOverviewResult>(overviewRaw);
   }
+
+  overviewParsed = applyTimelinePolicyToOverview(planningParams.goalName, overviewParsed, timeline);
 
   const overviewAnalysis = analyzeLocalAIOutput(overviewRaw);
 
   let monthOnePrompt: string | null = null;
   let monthOneRaw: string | null = null;
   let monthOneParsed: AIPlanDetailsResult | null = null;
+  let monthOneRepairPrompt: string | null = null;
   let monthOneAnalysis = analyzeLocalAIOutput(null);
+  let dayRoutinesPrompt: string | null = null;
+  let dayRoutinesRaw: string | null = null;
+  let dayRoutinesParsed: AIPlanDetailsResult | null = null;
+  let dayRoutinesRepairPrompt: string | null = null;
+  let dayRoutinesAnalysis = analyzeLocalAIOutput(null);
 
   if (overviewParsed) {
     monthOnePrompt = buildMonthOnePrompt(planningParams, overviewParsed);
     monthOneRaw = await callLocalModel(monthOnePrompt, onLocalAIProgress, {
-      required: requireLocalAI,
+      required: false,
     });
     monthOneParsed = tryParseJSON<AIPlanDetailsResult>(monthOneRaw);
 
-    if (!monthOneParsed && requireLocalAI && monthOneRaw) {
-      console.log('[aiService] Retrying Gemma plan details after invalid JSON.');
-      monthOneRaw = await callLocalModel(monthOnePrompt, onLocalAIProgress, {
-        required: true,
+    if (!hasUsableWeeklyFocus(monthOneParsed)) {
+      console.log('[aiService] Retrying Gemma starter sequence with compact repair prompt.');
+      monthOneRepairPrompt = buildMonthOneRepairPrompt(planningParams, overviewParsed);
+      monthOneRaw = await callLocalModel(monthOneRepairPrompt, onLocalAIProgress, {
+        required: false,
       });
       monthOneParsed = tryParseJSON<AIPlanDetailsResult>(monthOneRaw);
     }
 
     monthOneAnalysis = analyzeLocalAIOutput(monthOneRaw);
+
+    dayRoutinesPrompt = buildDayRoutinesPrompt(planningParams, overviewParsed, monthOneParsed);
+    dayRoutinesRaw = await callLocalModel(dayRoutinesPrompt, onLocalAIProgress, {
+      required: false,
+    });
+    dayRoutinesParsed = tryParseJSON<AIPlanDetailsResult>(dayRoutinesRaw);
+
+    if (!hasUsableDayRoutines(dayRoutinesParsed)) {
+      console.log('[aiService] Retrying Gemma day routines with compact repair prompt.');
+      dayRoutinesRepairPrompt = buildDayRoutinesRepairPrompt(planningParams, overviewParsed, monthOneParsed);
+      dayRoutinesRaw = await callLocalModel(dayRoutinesRepairPrompt, onLocalAIProgress, {
+        required: false,
+      });
+      dayRoutinesParsed = tryParseJSON<AIPlanDetailsResult>(dayRoutinesRaw);
+    }
+
+    dayRoutinesAnalysis = analyzeLocalAIOutput(dayRoutinesRaw);
   }
 
-  const requiredDetailsMissing = Boolean(
-    requireLocalAI &&
-      overviewParsed &&
-      (!monthOneParsed ||
-        !Array.isArray(monthOneParsed.weeklyFocus) ||
-        monthOneParsed.weeklyFocus.length === 0 ||
-        !Array.isArray(monthOneParsed.dayRoutines) ||
-        monthOneParsed.dayRoutines.length === 0),
-  );
-  const parsed = Boolean(overviewParsed) && !requiredDetailsMissing;
+  const parsed = Boolean(overviewParsed);
   const combinedPlan =
-    overviewParsed && !requiredDetailsMissing
+    overviewParsed
       ? normalizePlan(
           planningParams.goalName,
           {
             ...overviewParsed,
             ...(monthOneParsed || {}),
+            ...(dayRoutinesParsed || {}),
             continuationNote: normalizeContinuationNote(
               planningParams.goalName,
               monthOneParsed?.continuationNote,
@@ -2183,34 +2516,61 @@ export async function generateAIPlan(params: {
         )
       : null;
 
+  const promptParts = [
+    overviewPrompt,
+    overviewRepairPrompt,
+    monthOnePrompt,
+    monthOneRepairPrompt,
+    dayRoutinesPrompt,
+    dayRoutinesRepairPrompt,
+  ].filter(Boolean) as string[];
+  const promptChars = promptParts.reduce((total, prompt) => total + prompt.length, 0);
+  const promptEstimatedTokens = promptParts.reduce((total, prompt) => total + estimateTokenCount(prompt), 0);
+  const rawOutputChars =
+    overviewAnalysis.rawOutputChars + monthOneAnalysis.rawOutputChars + dayRoutinesAnalysis.rawOutputChars;
+  const rawOutputEstimatedTokens =
+    overviewAnalysis.rawOutputEstimatedTokens +
+    monthOneAnalysis.rawOutputEstimatedTokens +
+    dayRoutinesAnalysis.rawOutputEstimatedTokens;
+  const possibleTruncation =
+    overviewAnalysis.possibleTruncation ||
+    monthOneAnalysis.possibleTruncation ||
+    dayRoutinesAnalysis.possibleTruncation;
+
   const debugSnapshot: LocalAIDebugSnapshot = {
     mode: 'plan',
-    prompt: [overviewPrompt, monthOnePrompt].filter(Boolean).join('\n\n---\n\n'),
+    prompt: promptParts.join('\n\n---\n\n'),
     rawOutput: [
       overviewRaw ? `[overview]\n${overviewRaw}` : null,
-      monthOneRaw ? `[month_1]\n${monthOneRaw}` : null,
+      monthOneRaw ? `[starter_sequence]\n${monthOneRaw}` : null,
+      dayRoutinesRaw ? `[day_routines]\n${dayRoutinesRaw}` : null,
     ]
       .filter(Boolean)
       .join('\n\n'),
     parsed,
-    promptChars: overviewPrompt.length + (monthOnePrompt?.length || 0),
-    promptEstimatedTokens: estimateTokenCount(overviewPrompt) + estimateTokenCount(monthOnePrompt),
-    rawOutputChars: overviewAnalysis.rawOutputChars + monthOneAnalysis.rawOutputChars,
-    rawOutputEstimatedTokens:
-      overviewAnalysis.rawOutputEstimatedTokens + monthOneAnalysis.rawOutputEstimatedTokens,
+    promptChars,
+    promptEstimatedTokens,
+    rawOutputChars,
+    rawOutputEstimatedTokens,
     extractedJSONObject:
-      overviewAnalysis.extractedJSONObject && (monthOnePrompt ? monthOneAnalysis.extractedJSONObject : true),
-    possibleTruncation: overviewAnalysis.possibleTruncation || monthOneAnalysis.possibleTruncation,
+      overviewAnalysis.extractedJSONObject &&
+      (monthOnePrompt ? monthOneAnalysis.extractedJSONObject : true) &&
+      (dayRoutinesPrompt ? dayRoutinesAnalysis.extractedJSONObject : true),
+    possibleTruncation,
     contextSummary: [
       `Overview parsed: ${overviewParsed ? 'yes' : 'no'}`,
-      `Detail layer parsed: ${monthOneParsed ? 'yes' : 'no'}`,
+      `Overview repair used: ${overviewRepairPrompt ? 'yes' : 'no'}`,
+      `Starter sequence parsed: ${hasUsableWeeklyFocus(monthOneParsed) ? 'yes' : 'no'}`,
+      `Day routines parsed: ${hasUsableDayRoutines(dayRoutinesParsed) ? 'yes' : 'no'}`,
       `Timeline: ${timeline.count} ${getTimelineUnitLabel(timeline.unit, timeline.count).toLowerCase()}`,
       `Detail layer: ${getTimelineDetailCount(timeline)} ${getTimelineUnitLabel(getTimelineDetailUnit(timeline.unit), getTimelineDetailCount(timeline)).toLowerCase()}`,
-      `Prompt chars: ${overviewPrompt.length + (monthOnePrompt?.length || 0)}`,
-      `Prompt est tokens: ${estimateTokenCount(overviewPrompt) + estimateTokenCount(monthOnePrompt)}`,
-      `Output chars: ${overviewAnalysis.rawOutputChars + monthOneAnalysis.rawOutputChars}`,
-      `Output est tokens: ${overviewAnalysis.rawOutputEstimatedTokens + monthOneAnalysis.rawOutputEstimatedTokens}`,
-      `Possible truncation: ${overviewAnalysis.possibleTruncation || monthOneAnalysis.possibleTruncation ? 'yes' : 'no'}`,
+      `Starter repair used: ${monthOneRepairPrompt ? 'yes' : 'no'}`,
+      `Day routine repair used: ${dayRoutinesRepairPrompt ? 'yes' : 'no'}`,
+      `Prompt chars: ${promptChars}`,
+      `Prompt est tokens: ${promptEstimatedTokens}`,
+      `Output chars: ${rawOutputChars}`,
+      `Output est tokens: ${rawOutputEstimatedTokens}`,
+      `Possible truncation: ${possibleTruncation ? 'yes' : 'no'}`,
     ].join(' | '),
   };
   setLastLocalAIDebugSnapshot(debugSnapshot);

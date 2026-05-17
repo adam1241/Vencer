@@ -21,6 +21,7 @@ import java.io.FileOutputStream
 import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
+import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -37,6 +38,9 @@ class GemmaLocalAiModule(
     private const val MODEL_FILE_NAME = "gemma-4-E4B-it.litertlm"
     private const val DIAGNOSTICS_FILE_NAME = "gemma_diagnostics.log"
     private const val EXPECTED_MODEL_BYTES = 3_659_530_240L
+    private const val EXPECTED_MODEL_SHA256 = "0b2a8980ce155fd97673d8e820b4d29d9c7d99b8fa6806f425d969b145bd52e0"
+    private const val MODEL_CHECKSUM_FILE_NAME = "gemma-4-E4B-it.sha256"
+    private const val MODEL_PART_MARKER_FILE_NAME = "gemma-4-E4B-it.part.sha256"
     private const val MIN_DEVICE_MEMORY_BYTES = 8L * 1024L * 1024L * 1024L
     private const val REQUIRED_FREE_BYTES = 5_200_000_000L
     private const val DEFAULT_MAX_TOKENS = 3000
@@ -187,20 +191,28 @@ class GemmaLocalAiModule(
   private fun downloadModelIfNeeded() {
     val modelFile = getModelFile()
     if (isCompleteModelFile(modelFile)) {
-      totalBytes = modelFile.length()
-      downloadedBytes = modelFile.length()
-      appendDiagnostic("downloadModelIfNeeded: existing model accepted (${modelFile.length()} bytes)")
-      return
+      if (isVerifiedModelFile(modelFile)) {
+        totalBytes = modelFile.length()
+        downloadedBytes = modelFile.length()
+        appendDiagnostic("downloadModelIfNeeded: existing verified model accepted (${modelFile.length()} bytes)")
+        return
+      }
+
+      appendDiagnostic("downloadModelIfNeeded: existing model checksum mismatch; deleting and redownloading")
+      modelFile.delete()
+      getModelChecksumFile().delete()
     }
 
     val tempFile = File(modelFile.parentFile, "$MODEL_FILE_NAME.part")
     modelFile.parentFile?.mkdirs()
     recoverIncompleteFinalModel(modelFile, tempFile)
+    discardStalePartialDownload(tempFile)
 
     state = "downloading"
     lastError = null
     downloadedBytes = if (tempFile.exists()) tempFile.length() else 0L
     totalBytes = 0L
+    getModelPartMarkerFile().writeText(EXPECTED_MODEL_SHA256)
     appendDiagnostic("downloadModelIfNeeded: starting download from byte $downloadedBytes")
 
     val connection = URL(MODEL_URL).openConnection() as HttpURLConnection
@@ -248,12 +260,21 @@ class GemmaLocalAiModule(
         throw IllegalStateException("Gemma download is incomplete (${tempFile.length()} of $EXPECTED_MODEL_BYTES bytes). Keep the app open with internet and try again.")
       }
 
+      if (!isDownloadedModelChecksumValid(tempFile)) {
+        val actualSha = computeSha256(tempFile)
+        appendDiagnostic("downloadModelIfNeeded: checksum mismatch actual=$actualSha expected=$EXPECTED_MODEL_SHA256")
+        tempFile.delete()
+        throw IllegalStateException("Gemma download checksum did not match. The app cleared the bad file; try the download again.")
+      }
+
       if (modelFile.exists()) {
         modelFile.delete()
       }
       if (!tempFile.renameTo(modelFile)) {
         throw IllegalStateException("Could not finalize the downloaded model file")
       }
+      writeModelChecksumMarker()
+      getModelPartMarkerFile().delete()
 
       downloadedBytes = modelFile.length()
       totalBytes = modelFile.length()
@@ -262,6 +283,7 @@ class GemmaLocalAiModule(
     } catch (error: Throwable) {
       if (tempFile.exists() && tempFile.length() == 0L) {
         tempFile.delete()
+        getModelPartMarkerFile().delete()
       }
       appendDiagnostic("downloadModelIfNeeded failed: ${error.message}")
       throw error
@@ -327,6 +349,60 @@ class GemmaLocalAiModule(
   private fun isCompleteModelFile(file: File): Boolean =
     file.exists() && file.length() == EXPECTED_MODEL_BYTES
 
+  private fun isVerifiedModelFile(file: File): Boolean {
+    if (!isCompleteModelFile(file)) return false
+
+    val marker = getModelChecksumFile()
+    if (marker.exists() && marker.readText().trim().equals(EXPECTED_MODEL_SHA256, ignoreCase = true)) {
+      return true
+    }
+
+    appendDiagnostic("isVerifiedModelFile: verifying sha256 for existing model")
+    val actualSha = computeSha256(file)
+    if (actualSha.equals(EXPECTED_MODEL_SHA256, ignoreCase = true)) {
+      writeModelChecksumMarker()
+      appendDiagnostic("isVerifiedModelFile: checksum accepted")
+      return true
+    }
+
+    appendDiagnostic("isVerifiedModelFile: checksum mismatch actual=$actualSha expected=$EXPECTED_MODEL_SHA256")
+    return false
+  }
+
+  private fun isDownloadedModelChecksumValid(file: File): Boolean =
+    computeSha256(file).equals(EXPECTED_MODEL_SHA256, ignoreCase = true)
+
+  private fun computeSha256(file: File): String {
+    val digest = MessageDigest.getInstance("SHA-256")
+    FileInputStream(file).use { input ->
+      val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+      while (true) {
+        val read = input.read(buffer)
+        if (read <= 0) break
+        digest.update(buffer, 0, read)
+      }
+    }
+    return digest.digest().joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+  }
+
+  private fun writeModelChecksumMarker() {
+    getModelChecksumFile().writeText(EXPECTED_MODEL_SHA256)
+  }
+
+  private fun discardStalePartialDownload(tempFile: File) {
+    if (!tempFile.exists()) return
+
+    val marker = getModelPartMarkerFile()
+    val markerMatches =
+      marker.exists() && marker.readText().trim().equals(EXPECTED_MODEL_SHA256, ignoreCase = true)
+
+    if (!markerMatches || tempFile.length() >= EXPECTED_MODEL_BYTES) {
+      appendDiagnostic("discardStalePartialDownload: deleting stale partial file (${tempFile.length()} bytes)")
+      tempFile.delete()
+      marker.delete()
+    }
+  }
+
   private fun recoverIncompleteFinalModel(modelFile: File, tempFile: File) {
     if (!modelFile.exists()) return
 
@@ -337,26 +413,30 @@ class GemmaLocalAiModule(
       "recoverIncompleteFinalModel: existing final file has unexpected size $modelBytes; expected $EXPECTED_MODEL_BYTES",
     )
 
-    if (modelBytes in 1 until EXPECTED_MODEL_BYTES) {
-      if (!tempFile.exists() || tempFile.length() < modelBytes) {
-        if (tempFile.exists()) {
-          tempFile.delete()
-        }
-        if (modelFile.renameTo(tempFile)) {
-          appendDiagnostic("recoverIncompleteFinalModel: moved incomplete final file to partial download")
-          return
-        }
-      }
+    // A final model file with the wrong size is usually from an older model URL or
+    // a corrupted resume. Do not append new bytes onto it; start a clean download.
+    if (tempFile.exists()) {
+      tempFile.delete()
     }
+    getModelChecksumFile().delete()
+    getModelPartMarkerFile().delete()
 
     if (!modelFile.delete()) {
       appendDiagnostic("recoverIncompleteFinalModel: could not delete unexpected final file")
       throw IllegalStateException("Gemma model file is incomplete and could not be repaired. Clear app storage and try again.")
     }
+
+    appendDiagnostic("recoverIncompleteFinalModel: deleted unexpected final file; clean download required")
   }
 
   private fun getModelFile(): File =
     File(File(reactApplicationContext.filesDir, "models"), MODEL_FILE_NAME)
+
+  private fun getModelChecksumFile(): File =
+    File(File(reactApplicationContext.filesDir, "models"), MODEL_CHECKSUM_FILE_NAME)
+
+  private fun getModelPartMarkerFile(): File =
+    File(File(reactApplicationContext.filesDir, "models"), MODEL_PART_MARKER_FILE_NAME)
 
   private fun getDiagnosticsFile(): File =
     File(reactApplicationContext.filesDir, DIAGNOSTICS_FILE_NAME)
