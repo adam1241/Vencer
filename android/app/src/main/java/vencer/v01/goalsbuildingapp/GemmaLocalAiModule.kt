@@ -44,6 +44,8 @@ class GemmaLocalAiModule(
     private const val DEFAULT_TOP_P = 0.0
     private const val DEFAULT_TEMPERATURE = 0.0
     private const val DEFAULT_RANDOM_SEED = 101
+    private const val DOWNLOAD_CONNECT_TIMEOUT_MS = 30_000
+    private const val DOWNLOAD_READ_TIMEOUT_MS = 120_000
   }
 
   private val executor = Executors.newSingleThreadExecutor()
@@ -190,23 +192,23 @@ class GemmaLocalAiModule(
     }
 
     val tempFile = File(modelFile.parentFile, "$MODEL_FILE_NAME.part")
-    if (tempFile.exists()) {
-      tempFile.delete()
-    }
     modelFile.parentFile?.mkdirs()
 
     state = "downloading"
     lastError = null
-    downloadedBytes = 0L
+    downloadedBytes = if (tempFile.exists()) tempFile.length() else 0L
     totalBytes = 0L
-    appendDiagnostic("downloadModelIfNeeded: starting download")
+    appendDiagnostic("downloadModelIfNeeded: starting download from byte $downloadedBytes")
 
     val connection = URL(MODEL_URL).openConnection() as HttpURLConnection
     connection.instanceFollowRedirects = true
-    connection.connectTimeout = 30_000
-    connection.readTimeout = 30_000
+    connection.connectTimeout = DOWNLOAD_CONNECT_TIMEOUT_MS
+    connection.readTimeout = DOWNLOAD_READ_TIMEOUT_MS
     connection.setRequestProperty("Accept", "*/*")
     connection.setRequestProperty("User-Agent", "Vencer-Android/1.0")
+    if (downloadedBytes > 0L) {
+      connection.setRequestProperty("Range", "bytes=$downloadedBytes-")
+    }
 
     try {
       connection.connect()
@@ -215,10 +217,18 @@ class GemmaLocalAiModule(
         throw IllegalStateException("Model download failed with HTTP ${connection.responseCode}")
       }
 
-      totalBytes = connection.contentLengthLong.coerceAtLeast(0L)
+      val shouldAppend = downloadedBytes > 0L && connection.responseCode == HttpURLConnection.HTTP_PARTIAL
+      if (downloadedBytes > 0L && !shouldAppend) {
+        appendDiagnostic("downloadModelIfNeeded: server did not resume; restarting full download")
+        tempFile.delete()
+        downloadedBytes = 0L
+      }
+
+      val contentLength = connection.contentLengthLong.coerceAtLeast(0L)
+      totalBytes = if (shouldAppend) downloadedBytes + contentLength else contentLength
 
       connection.inputStream.use { input ->
-        FileOutputStream(tempFile).use { output ->
+        FileOutputStream(tempFile, shouldAppend).use { output ->
           val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
           while (true) {
             val read = input.read(buffer)
@@ -231,7 +241,8 @@ class GemmaLocalAiModule(
       }
 
       if (tempFile.length() < MIN_MODEL_BYTES) {
-        throw IllegalStateException("Downloaded model is incomplete or corrupt")
+        appendDiagnostic("downloadModelIfNeeded: partial download kept (${tempFile.length()} bytes)")
+        throw IllegalStateException("Gemma download is incomplete. Keep the app open with internet and try again.")
       }
 
       if (modelFile.exists()) {
@@ -246,7 +257,9 @@ class GemmaLocalAiModule(
       appendDiagnostic("downloadModelIfNeeded: download complete (${modelFile.length()} bytes)")
       Log.i(TAG, "Gemma model ready at ${modelFile.absolutePath}")
     } catch (error: Throwable) {
-      tempFile.delete()
+      if (tempFile.exists() && tempFile.length() == 0L) {
+        tempFile.delete()
+      }
       appendDiagnostic("downloadModelIfNeeded failed: ${error.message}")
       throw error
     } finally {

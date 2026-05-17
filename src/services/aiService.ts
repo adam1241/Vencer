@@ -20,12 +20,14 @@ type LocalAiStatus = {
   downloadedBytes: number;
   totalBytes: number;
   lastError?: string | null;
+  diagnosticsPath?: string | null;
 };
 
 type LocalAiModuleType = {
   prepareModel(): Promise<LocalAiStatus>;
   getStatus(): Promise<LocalAiStatus>;
   generate(prompt: string): Promise<string>;
+  getDiagnostics?(): Promise<string>;
 };
 
 export type LocalAIState =
@@ -936,7 +938,7 @@ export function describeLocalAIProgress(progress: LocalAIProgress, taskLabel = '
 }
 
 export function describeLocalAIAttribution(status?: { ready?: boolean; backend?: string } | null) {
-  if (!status?.ready) return 'Deterministic plan';
+  if (!status?.ready) return 'Local AI plan';
   const backend = String(status.backend || '').toUpperCase();
   return backend ? `Local AI plan (${backend})` : 'Local AI plan';
 }
@@ -961,6 +963,17 @@ export async function getLocalAIStatus(): Promise<LocalAiStatus | null> {
     return await gemmaModule.getStatus();
   } catch (error) {
     console.log('[aiService] Could not read local AI status:', (error as Error).message);
+    return null;
+  }
+}
+
+export async function getLocalAIDiagnostics(): Promise<string | null> {
+  if (!supportsLocalAi() || !gemmaModule?.getDiagnostics) return null;
+
+  try {
+    return await gemmaModule.getDiagnostics();
+  } catch (error) {
+    console.log('[aiService] Could not read local AI diagnostics:', (error as Error).message);
     return null;
   }
 }
@@ -1011,10 +1024,16 @@ async function prepareLocalAI(onProgress?: (progress: LocalAIProgress) => void):
 async function callLocalModel(
   prompt: string,
   onProgress?: (progress: LocalAIProgress) => void,
+  options: { required?: boolean } = {},
 ): Promise<string | null> {
   if (!supportsLocalAi() || !gemmaModule) {
-    console.log('[aiService] Local AI is only available on Android native builds.');
-    onProgress?.(buildLocalAIProgress(null));
+    const message = 'Local AI is only available on Android native builds.';
+    console.log(`[aiService] ${message}`);
+    const progress = buildLocalAIProgress(null);
+    onProgress?.(progress);
+    if (options.required) {
+      throw new Error(message);
+    }
     return null;
   }
 
@@ -1038,12 +1057,16 @@ async function callLocalModel(
     return raw;
   } catch (error) {
     console.log('[aiService] Local Gemma call failed:', (error as Error).message);
+    const status = await getLocalAIStatus();
     onProgress?.(
-      buildLocalAIProgress(await getLocalAIStatus(), {
+      buildLocalAIProgress(status, {
         state: 'failed',
         lastError: (error as Error).message,
       }),
     );
+    if (options.required) {
+      throw error instanceof Error ? error : new Error('Local Gemma call failed.');
+    }
     return null;
   }
 }
@@ -2078,15 +2101,27 @@ export async function generateAIPlan(params: {
   specificTimes?: string[];
   constraints?: string;
   stylePreference?: string;
+  requireLocalAI?: boolean;
   onLocalAIProgress?: (progress: LocalAIProgress) => void;
 }): Promise<AIPlanResult | null> {
-  const { onLocalAIProgress, ...planningParams } = params;
+  const { onLocalAIProgress, requireLocalAI = false, ...planningParams } = params;
   const effectiveTimeBudgetMinutes =
     Number(planningParams.timeBudgetMinutes) || DEFAULT_ASSUMED_TIME_BUDGET_MINUTES;
   const timeline = buildPlanTimeline(planningParams.goalName, planningParams.deadline);
   const overviewPrompt = buildPlanningOverviewPrompt(planningParams);
-  const overviewRaw = await callLocalModel(overviewPrompt, onLocalAIProgress);
-  const overviewParsed = tryParseJSON<AIPlanOverviewResult>(overviewRaw);
+  let overviewRaw = await callLocalModel(overviewPrompt, onLocalAIProgress, {
+    required: requireLocalAI,
+  });
+  let overviewParsed = tryParseJSON<AIPlanOverviewResult>(overviewRaw);
+
+  if (!overviewParsed && requireLocalAI && overviewRaw) {
+    console.log('[aiService] Retrying Gemma planning overview after invalid JSON.');
+    overviewRaw = await callLocalModel(overviewPrompt, onLocalAIProgress, {
+      required: true,
+    });
+    overviewParsed = tryParseJSON<AIPlanOverviewResult>(overviewRaw);
+  }
+
   const overviewAnalysis = analyzeLocalAIOutput(overviewRaw);
 
   let monthOnePrompt: string | null = null;
@@ -2096,14 +2131,34 @@ export async function generateAIPlan(params: {
 
   if (overviewParsed) {
     monthOnePrompt = buildMonthOnePrompt(planningParams, overviewParsed);
-    monthOneRaw = await callLocalModel(monthOnePrompt, onLocalAIProgress);
+    monthOneRaw = await callLocalModel(monthOnePrompt, onLocalAIProgress, {
+      required: requireLocalAI,
+    });
     monthOneParsed = tryParseJSON<AIPlanDetailsResult>(monthOneRaw);
+
+    if (!monthOneParsed && requireLocalAI && monthOneRaw) {
+      console.log('[aiService] Retrying Gemma plan details after invalid JSON.');
+      monthOneRaw = await callLocalModel(monthOnePrompt, onLocalAIProgress, {
+        required: true,
+      });
+      monthOneParsed = tryParseJSON<AIPlanDetailsResult>(monthOneRaw);
+    }
+
     monthOneAnalysis = analyzeLocalAIOutput(monthOneRaw);
   }
 
-  const parsed = Boolean(overviewParsed);
+  const requiredDetailsMissing = Boolean(
+    requireLocalAI &&
+      overviewParsed &&
+      (!monthOneParsed ||
+        !Array.isArray(monthOneParsed.weeklyFocus) ||
+        monthOneParsed.weeklyFocus.length === 0 ||
+        !Array.isArray(monthOneParsed.dayRoutines) ||
+        monthOneParsed.dayRoutines.length === 0),
+  );
+  const parsed = Boolean(overviewParsed) && !requiredDetailsMissing;
   const combinedPlan =
-    overviewParsed
+    overviewParsed && !requiredDetailsMissing
       ? normalizePlan(
           planningParams.goalName,
           {
@@ -2126,7 +2181,7 @@ export async function generateAIPlan(params: {
         )
       : null;
 
-  setLastLocalAIDebugSnapshot({
+  const debugSnapshot: LocalAIDebugSnapshot = {
     mode: 'plan',
     prompt: [overviewPrompt, monthOnePrompt].filter(Boolean).join('\n\n---\n\n'),
     rawOutput: [
@@ -2155,7 +2210,15 @@ export async function generateAIPlan(params: {
       `Output est tokens: ${overviewAnalysis.rawOutputEstimatedTokens + monthOneAnalysis.rawOutputEstimatedTokens}`,
       `Possible truncation: ${overviewAnalysis.possibleTruncation || monthOneAnalysis.possibleTruncation ? 'yes' : 'no'}`,
     ].join(' | '),
-  });
+  };
+  setLastLocalAIDebugSnapshot(debugSnapshot);
+
+  if (requireLocalAI && !combinedPlan) {
+    const status = await getLocalAIStatus();
+    const reason = describeLocalAIFallbackReason({ status, snapshot: debugSnapshot });
+    throw new Error(reason);
+  }
+
   if (!combinedPlan) return null;
 
   return combinedPlan;

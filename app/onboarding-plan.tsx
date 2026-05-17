@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { View, Text, StyleSheet, SafeAreaView, ActivityIndicator } from 'react-native';
+import { View, Text, StyleSheet, SafeAreaView, ActivityIndicator, Alert } from 'react-native';
 import { useRouter } from 'expo-router';
 import { COLORS, SIZES } from '../src/constants/theme';
 import { buildStrategyFromAnswers, GoalAnswers, inferGoalSticker } from '../src/services/goalBuilder';
@@ -75,6 +75,7 @@ export default function OnboardingPlanScreen() {
           specificTimes: profile.specificTimes,
           constraints: profile.constraints,
           stylePreference: profile.stylePreference,
+          requireLocalAI: true,
         });
         const status = await getLocalAIStatus();
         const snapshot = getLastLocalAIDebugSnapshot();
@@ -141,6 +142,12 @@ export default function OnboardingPlanScreen() {
             parsed: snapshot?.parsed ?? false,
             contextSummary: snapshot?.contextSummary,
           });
+          Alert.alert(
+            'Gemma did not finish the plan',
+            `${aiDebugSummary}\n\nKeep internet on, leave the app open while Gemma downloads/prepares, and try again.`,
+            [{ text: 'Back', onPress: () => router.replace('/onboarding') }],
+          );
+          return;
         }
       } catch (e) {
         const status = await getLocalAIStatus();
@@ -161,7 +168,13 @@ export default function OnboardingPlanScreen() {
           parsed: snapshot?.parsed ?? false,
           contextSummary: snapshot?.contextSummary,
         });
-        console.warn('AI plan generation failed, using deterministic fallback', e);
+        console.warn('AI plan generation failed', e);
+        Alert.alert(
+          'Gemma did not finish the plan',
+          `${aiDebugSummary}\n\nKeep internet on, leave the app open while Gemma downloads/prepares, and try again.`,
+          [{ text: 'Back', onPress: () => router.replace('/onboarding') }],
+        );
+        return;
       }
 
       // Navigate to review screen (after AI wait)

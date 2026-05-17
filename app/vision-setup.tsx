@@ -345,6 +345,7 @@ export default function VisionSetupScreen() {
         specificTimes: notificationPref === 'Specific times' ? specificTimes : undefined,
         constraints: value,
         stylePreference: 'Flexible & adaptive',
+        requireLocalAI: true,
         onLocalAIProgress: setLocalAIProgress,
       });
       const status = await getLocalAIStatus();
@@ -419,6 +420,12 @@ export default function VisionSetupScreen() {
           parsed: snapshot?.parsed ?? false,
           contextSummary: snapshot?.contextSummary,
         });
+        setIsLoading(false);
+        Alert.alert(
+          'Gemma did not finish the plan',
+          `${aiDebugSummary}\n\nKeep internet on, leave the app open while Gemma downloads/prepares, and try again.`,
+        );
+        return;
       }
     } catch (e) {
       const status = await getLocalAIStatus();
@@ -437,7 +444,13 @@ export default function VisionSetupScreen() {
         parsed: snapshot?.parsed ?? false,
         contextSummary: snapshot?.contextSummary,
       });
-      console.log('AI plan generation failed, using deterministic plan:', e);
+      console.log('AI plan generation failed:', e);
+      setIsLoading(false);
+      Alert.alert(
+        'Gemma did not finish the plan',
+        `${aiDebugSummary}\n\nKeep internet on, leave the app open while Gemma downloads/prepares, and try again.`,
+      );
+      return;
     }
 
     if (!strategy.goal.aiLabel) {

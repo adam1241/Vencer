@@ -16,17 +16,16 @@ export default function Layout() {
       }
     };
 
-    // TEMPORARILY DISABLED
-    // const initLocalAi = async () => {
-    //   try {
-    //     const { initializeLocalAI } = await import('../src/services/aiService');
-    //     await initializeLocalAI();
-    //   } catch (e) {
-    //     console.log('Local Gemma not ready yet:', e);
-    //   }
-    // };
+    const initLocalAi = async () => {
+      try {
+        const { initializeLocalAI } = await import('../src/services/aiService');
+        await initializeLocalAI();
+      } catch (e) {
+        console.log('Local Gemma not ready yet:', e);
+      }
+    };
 
-    // initLocalAi();
+    initLocalAi();
     initNotifications();
   }, []);
 
